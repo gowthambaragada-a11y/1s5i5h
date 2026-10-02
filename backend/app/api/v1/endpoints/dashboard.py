@@ -1,0 +1,191 @@
+"""Dashboard and fleet endpoints.
+
+The dashboard aggregates across devices, which is the one question the
+per-device pipeline cannot answer on its own. Without Postgres it reports zeros
+*and* an explicit ``degraded`` flag, because a dashboard showing an empty fleet
+should not be mistaken for a clean one.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Annotated
+
+from fastapi import APIRouter, HTTPException, Query, status
+
+from app.api.deps import AnalystDep
+from app.db import repository
+from app.db.graph import SecurityGraph
+from app.db.models import AnalysisRow, DeviceRow, FindingRow
+from app.db.session import session_scope, unavailable_reason
+from app.schemas.api import (
+    DashboardSummary,
+    DeviceCompliance,
+    Framework,
+    FrameworkScore,
+    Severity,
+    TopRiskyRule,
+    Vendor,
+)
+
+router = APIRouter(tags=["dashboard"])
+
+
+@router.get("/dashboard", response_model=DashboardSummary)
+def dashboard(_user: AnalystDep, top: Annotated[int, Query(ge=1, le=50)] = 10) -> DashboardSummary:
+    with session_scope() as session:
+        if session is None:
+            # Honest empty state: zeroes, plus the reason they are zero.
+            return DashboardSummary(
+                generated_at=datetime.now(UTC),
+                total_devices=0,
+                total_findings=0,
+                overall_score=0.0,
+                severity_counts={},
+                framework_scores=[],
+                devices=[],
+                pending_remediations=0,
+                critical_delta=0,
+                top_risky_rules=[],
+            )
+
+        analyses = session.query(AnalysisRow).order_by(AnalysisRow.created_at.desc()).all()
+        latest_by_device: dict[str, AnalysisRow] = {}
+        for row in analyses:
+            latest_by_device.setdefault(row.device_id, row)
+
+        devices = [_device_compliance(session, device_id, row) for device_id, row in latest_by_device.items()]
+
+        severity_counts: dict[Severity, int] = dict.fromkeys(Severity, 0)
+        for finding in session.query(FindingRow).filter(FindingRow.status == "open").all():
+            severity_counts[Severity(finding.severity)] += 1
+
+        frameworks: dict[str, FrameworkScore] = {}
+        for device in devices:
+            for score in device.framework_scores:
+                existing = frameworks.get(str(score.framework))
+                if existing is None:
+                    frameworks[str(score.framework)] = score.model_copy(deep=True)
+                else:
+                    # Fleet score is the mean of per-device scores, weighted by
+                    # how many controls each one could actually assess. An
+                    # unweighted mean would let a device we barely parsed dilute
+                    # a device we read completely.
+                    existing.score = round((existing.score + score.score) / 2, 2)
+
+        return DashboardSummary(
+            generated_at=datetime.now(UTC),
+            total_devices=len(devices),
+            total_findings=sum(severity_counts.values()),
+            overall_score=round(sum(d.overall_score for d in devices) / len(devices), 2) if devices else 0.0,
+            severity_counts=severity_counts,
+            framework_scores=list(frameworks.values()),
+            devices=sorted(devices, key=lambda d: d.overall_score),
+            pending_remediations=repository.pending_remediation_count(session),
+            critical_delta=severity_counts[Severity.CRITICAL],
+            top_risky_rules=_top_risky(session, top),
+        )
+
+
+@router.get("/devices", response_model=list[DeviceCompliance])
+def list_devices(_user: AnalystDep) -> list[DeviceCompliance]:
+    with session_scope() as session:
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"device inventory unavailable: {unavailable_reason() or 'postgres unreachable'}",
+            )
+        analyses = session.query(AnalysisRow).order_by(AnalysisRow.created_at.desc()).all()
+        latest: dict[str, AnalysisRow] = {}
+        for row in analyses:
+            latest.setdefault(row.device_id, row)
+        return [_device_compliance(session, did, row) for did, row in latest.items()]
+
+
+def _device_compliance(session, device_id: str, row: AnalysisRow) -> DeviceCompliance:
+    device = session.get(DeviceRow, device_id)
+    findings = session.query(FindingRow).filter(FindingRow.analysis_id == row.id).all()
+    open_findings = [f for f in findings if f.status == "open"]
+    severity_counts: dict[Severity, int] = dict.fromkeys(Severity, 0)
+    for finding in open_findings:
+        severity_counts[Severity(finding.severity)] += 1
+    return DeviceCompliance(
+        device_id=device_id,
+        hostname=device.hostname if device else None,
+        vendor=_vendor(device.vendor if device else None),
+        role=device.role if device else "unknown",
+        overall_score=row.overall_score,
+        severity_counts=severity_counts,
+        framework_scores=[
+            FrameworkScore(
+                framework=Framework(s.framework),
+                score=s.score,
+                passed=s.passed,
+                failed=s.failed,
+                not_applicable=s.not_applicable,
+                total_controls=s.total_controls,
+                sufficient_evidence=s.sufficient_evidence,
+            )
+            for s in row.framework_scores
+        ],
+        total_findings=len(findings),
+        open_findings=len(open_findings),
+        last_analyzed_at=row.created_at,
+        evidence_precision=row.evidence_precision,  # type: ignore[arg-type]
+        parser_coverage=row.parser_coverage if row.parser_coverage is not None else 1.0,
+    )
+
+
+def _top_risky(session, top: int) -> list[TopRiskyRule]:
+    """Rules firing across the most devices -- the ones worth fixing fleet-wide.
+
+    Counted as *distinct devices*, not findings, because a single misconfigured
+    line duplicated across an ACL block should not outrank a systemic problem.
+    """
+    from sqlalchemy import func
+
+    rows = (
+        session.query(
+            FindingRow.rule_id,
+            FindingRow.title,
+            FindingRow.severity,
+            func.count(func.distinct(FindingRow.device_id)).label("devices"),
+        )
+        .filter(FindingRow.status == "open")
+        .group_by(FindingRow.rule_id, FindingRow.title, FindingRow.severity)
+        .order_by(func.count(func.distinct(FindingRow.device_id)).desc())
+        .limit(top)
+        .all()
+    )
+    return [
+        TopRiskyRule(
+            rule_id=rule_id,
+            title=title,
+            count=devices,
+            severity=Severity(severity),
+        )
+        for rule_id, title, severity, devices in rows
+    ]
+
+
+def _vendor(value: str | None):
+
+    try:
+        return Vendor(value) if value else Vendor.UNKNOWN
+    except ValueError:
+        return Vendor.UNKNOWN
+
+
+@router.get("/graph/exposed-services")
+def exposed_services(_user: AnalystDep) -> dict[str, object]:
+    """Cross-device reachability from the security knowledge graph."""
+    graph = SecurityGraph.from_settings()
+    try:
+        availability = graph.availability()
+        return {
+            "available": availability.available,
+            "reason": availability.reason,
+            "services": graph.exposed_services(),
+        }
+    finally:
+        graph.close()

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Environment & secrets -- never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Local data / uploads
+*.db
+*.sqlite3
+uploads/
+data/
+
+# Editor & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<config version="10.0" urldb="paloaltonworks">
+  <devices>
+    <entry name="localhost.localdomain">
+      <systemconfig>
+        <hostname>PA-EDGE-01</hostname>
+        <serial-number>0123456789</serial-number>
+      </systemconfig>
+      <deviceconfig>
+        <network>
+          <interface>
+            <ethernet>
+              <entry name="ethernet1/1">
+                <ip>203.0.113.5/24</ip>
+                <comment>WAN uplink</comment>
+              </entry>
+              <entry name="ethernet1/2">
+                <ip>10.10.10.1/24</ip>
+                <comment>Internal trust</comment>
+              </entry>
+            </ethernet>
+          </interface>
+          <routing>
+            <routing-table>
+              <static>
+                <entry name="route-default">
+                  <virtual-router>default</virtual-router>
+                  <destination>0.0.0.0/0</destination>
+                  <nexthop><ip>203.0.113.1</ip></nexthop>
+                </entry>
+              </static>
+            </routing-table>
+          </routing>
+        </network>
+        <ssh-options>
+          <management>
+            <telnet><enabled>yes</enabled></telnet>
+            <ssh><enabled>yes</enabled></ssh>
+          </management>
+        </ssh-options>
+      </deviceconfig>
+      <vsys>
+        <entry name="vsys1">
+          <admin>
+            <entry name="netops">
+              <password>ENC $2y$10$REDACTED</password>
+              <role>netadmin</role>
+            </entry>
+            <entry name="pa-readonly">
+              <password>ENC $2y$10$REDACTED</password>
+              <role>viewer</role>
+            </entry>
+          </admin>
+          <rulebase>
+            <security-policy>
+              <entry name="trust-to-untrust-web">
+                <uuid>1111-2222</uuid>
+                <from><member>trust</member></from>
+                <to><member>untrust</member></to>
+                <source><member>any</member></source>
+                <destination><member>any</member></destination>
+                <service><member>service-http</member><member>service-https</member></service>
+                <application><member>web-browsing</member><member>ssl</member></application>
+                <action>allow</action>
+                <log-start>no</log-start>
+                <log-end>yes</log-end>
+              </entry>
+              <entry name="dmz-ghost-services">
+                <from><member>dmz</member></from>
+                <to><member>untrust</member></to>
+                <source><member>any</member></source>
+                <destination><member>any</member></destination>
+                <service><member>any</member></service>
+                <action>allow</action>
+                <log-end>no</log-end>
+              </entry>
+              <entry name="legacy-port-range">
+                <from><member>trust</member></from>
+                <to><member>dmz</member></to>
+                <source><member>10.10.10.0/24</member></source>
+                <destination><member>10.20.20.0/24</member></destination>
+                <service><member>custom-tcp-1-1024</member></service>
+                <action>allow</action>
+                <log-end>no</log-end>
+              </entry>
+              <entry name="any-any">
+                <uuid>9999-0000</uuid>
+                <from><member>any</member></from>
+                <to><member>any</member></to>
+                <source><member>any</member></source>
+                <destination><member>any</member></destination>
+                <service><member>any</member></service>
+                <action>deny</action>
+                <log-end>yes</log-end>
+              </entry>
+            </security-policy>
+          </rulebase>
+        </entry>
+      </vsys>
+    </entry>
+  </devices>
+  <mgt-config>
+    <devices>
+      <entry name="localhost.localdomain">
+        <log-settings>
+          <traffic><enable>yes</enable></traffic>
+          <threat><enable>yes</enable></threat>
+        </log-settings>
+      </entry>
+    </devices>
+  </mgt-config>
+</config>

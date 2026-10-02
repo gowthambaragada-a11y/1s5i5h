@@ -1,0 +1,137 @@
+## Last commit: 2026-10-01T10:14:22Z by admin@RT-EDGE-01
+version 20.4R3.8;
+model: srx345;
+system {
+    host-name SRX-EDGE-01;
+    root-authentication {
+        encrypted-password "$6$abc$def"; ## SECRET-DATA
+    }
+    login {
+        user netops {
+            uid 2001;
+            user-class operator;
+            full-name "Network Operations";
+        }
+        user srxadmin {
+            uid 2000;
+            user-class super-user;
+            full-name "SRX Admin";
+        }
+    }
+    services {
+        ssh {
+            port 22;
+            root-login deny;
+            protocol-version 2;
+        }
+        telnet {
+            port 23;
+        }
+        web {
+            port 80;
+            https-only false;
+        }
+        syslog {
+            host 10.10.10.50 {
+                authorization any;
+            }
+            userinfo any;
+        }
+    }
+    syslog {
+        file interactive-commands {
+            any notice;
+        }
+        host 10.10.10.50 any notice;
+    }
+}
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 203.0.113.5/24;
+            }
+        }
+    }
+    ge-0/0/1 {
+        unit 0 {
+            family inet {
+                address 10.10.10.1/24;
+            }
+        }
+    }
+    ge-0/0/2 {
+        unit 0 {
+            family inet {
+                address 10.20.20.1/24;
+            }
+        }
+    }
+}
+security {
+    zones {
+        security-zone trust {
+            interfaces [ ge-0/0/1 ];
+        }
+        security-zone untrust {
+            interfaces [ ge-0/0/0 ];
+        }
+        security-zone dmz {
+            interfaces [ ge-0/0/2 ];
+        }
+    }
+    access-address {
+        address admins 10.10.10.0/24;
+        address host-web 10.20.20.10/32;
+        address-set critical-assets [ host-web ];
+    }
+    policies {
+        policy from-zone trust to-zone untrust {
+            policy allow-internet {
+                match {
+                    source-address any;
+                    destination-address any;
+                    application [ juniper-http juniper-https juniper-ssh ];
+                }
+                then {
+                    permit;
+                }
+            }
+            policy legacy-low-ports {
+                match {
+                    source-address admins;
+                    destination-address critical-assets;
+                    application any;
+                }
+                then {
+                    permit;
+                    log;
+                }
+            }
+        }
+        policy from-zone dmz to-zone untrust {
+            policy ghost-services {
+                match {
+                    source-address any;
+                    destination-address any;
+                    application juniper-ms-sql;
+                }
+                then {
+                    permit;
+                }
+            }
+        }
+    }
+    ike {
+        proposal ike-proposal-1 {
+            encryption-algorithm aes-128;
+            authentication-algorithm sha1;
+            dh-group 2;
+        }
+    }
+}
+routing-options {
+    static {
+        route 0.0.0.0/0 next-hop 203.0.113.1;
+    }
+}
