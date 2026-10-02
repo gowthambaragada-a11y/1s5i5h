@@ -10,11 +10,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.normalize import models as internal
+
+#: Item type of a {@link Paged} response.
+T = TypeVar("T")
 
 
 class Vendor(StrEnum):
@@ -277,8 +280,14 @@ class VendorCandidate(BaseModel):
     score: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
-class Paged(BaseModel):
-    items: list[Any]
+class Paged(BaseModel, Generic[T]):
+    """One page of results plus the unpaginated total, so a pager can size itself.
+
+    Generic rather than ``list[Any]`` so a route can declare the concrete item
+    type and FastAPI can document and validate the response against it.
+    """
+
+    items: list[T]
     total: int
     limit: int
     offset: int

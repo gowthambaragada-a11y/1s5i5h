@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import type { Remediation, RemediationQuery, RemediationStatus } from "../types/api";
+import { isReadOnly, onDemoModeChange } from "../api/client";
 import { useApproveRemediation, useRejectRemediation, useRemediations } from "../hooks/useAnalysis";
 import {
   REMEDIATION_STATUSES,
@@ -28,6 +29,10 @@ interface Toast {
 export function RemediationPage() {
   const [status, setStatus] = useState<RemediationStatus | "">("pending_review");
   const [toasts, setToasts] = useState<Toast[]>([]);
+  // A decision only exists if a server records it, so the approve/reject
+  // controls are withdrawn entirely on the static snapshot.
+  const [readOnly, setReadOnly] = useState(isReadOnly());
+  useEffect(() => onDemoModeChange(() => setReadOnly(true)), []);
 
   const queue = useRemediations(useMemo<RemediationQuery>(() => (status ? { status } : {}), [status]));
 
@@ -135,8 +140,8 @@ export function RemediationPage() {
             <div className="card-body">
               <RemediationCard
                 remediation={remediation}
-                onApprove={approve.approve}
-                onReject={reject.reject}
+                onApprove={readOnly ? undefined : approve.approve}
+                onReject={readOnly ? undefined : reject.reject}
                 busyId={busyId}
               />
             </div>

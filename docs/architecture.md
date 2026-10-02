@@ -246,7 +246,7 @@ Running with no database is a supported mode, not a failure mode.
 
 | Dependency | Unavailable behaviour |
 | --- | --- |
-| Postgres | Scans work. `/analyses`, `/devices`, `/remediations` return **503**. `/dashboard` returns zeros plus the reason. |
+| Postgres | Scans work. `/analyses`, `/findings`, `/devices`, `/remediations` return **503**. `/dashboard` returns zeros plus the reason. |
 | Neo4j | Graph endpoints return `{"available": false, "reason": ...}`. Analysis is unaffected. |
 | Peer group for ML | Anomaly stage skipped; warning recorded on the result. |
 
@@ -272,6 +272,7 @@ degraded and requires only the pipeline.
 | GET | `/analyses` | analyst | scan history |
 | GET | `/analyses/{id}` | analyst | one scan |
 | GET | `/dashboard` | analyst | fleet rollup |
+| GET | `/findings` | analyst | filtered, paginated findings |
 | GET | `/devices` | analyst | device inventory |
 | GET | `/remediations` | analyst | review queue |
 | POST | `/remediations/{id}/review` | analyst | approve / reject |
@@ -299,7 +300,7 @@ asserts this by scanning the generated OpenAPI schema for such a path.
 
 ## 8. Test strategy
 
-312 tests, no network or database server required.
+319 tests, no network or database server required.
 
 | Suite | Covers |
 | --- | --- |
@@ -318,7 +319,45 @@ running server is a suite nobody runs before committing.
 
 ---
 
-## 9. Layout
+## 9. Static demo deployment
+
+The frontend is deployed to GitHub Pages at
+`https://gowthambaragada-a11y.github.io/1s5i5h/` by
+`.github/workflows/deploy-pages.yml`, which runs on every push to `main` that
+touches `frontend/` or the sample configs.
+
+Three things make a subpath-hosted SPA work, each of which fails silently if
+missed:
+
+- **`base: "/1s5i5h/"`** in `vite.config.ts`, so asset URLs carry the repo prefix.
+  `BrowserRouter` reads the same value for its `basename`.
+- **A `404.html` that hands off to the SPA.** GitHub Pages has no rewrite rules,
+  so a refresh on `/1s5i5h/findings` is served the 404 document. It stashes the
+  original URL in `sessionStorage` and redirects to the root, where `main.tsx`
+  replays it.
+- **A demo dataset instead of a live API.** There is no backend behind a static
+  site, and on Pages an `/api/v1/*` path returns that same `404.html` with a 404
+  status — indistinguishable from a genuine "not found" without inspecting the
+  body. So the client probes `/healthz` once and commits to the answer: a
+  well-formed JSON health response means use the API, anything else means serve
+  the snapshot.
+
+### Demo mode
+
+`backend/scripts/export_demo_data.py` runs the **real pipeline** over the sample
+configs and writes `frontend/public/demo-data.json`. The demo numbers are
+therefore genuine output, not hand-written placeholders that could drift from
+what the tool actually does.
+
+Demo mode is honest about what it is. A banner states that no backend is
+reachable, and the controls that could not work are withdrawn rather than left
+in place: the upload panel is hidden and approve/reject are removed from the
+remediation queue, since a decision against a static snapshot would be a
+fabrication.
+
+---
+
+## 10. Layout
 
 ```
 backend/app/
@@ -331,4 +370,9 @@ backend/app/
   db/            models (SQLAlchemy), session, repository, graph (Neo4j)
   schemas/       API contracts
   api/           deps, v1/endpoints/
+backend/scripts/
+  export_demo_data.py      pipeline output -> frontend demo snapshot
+frontend/
+  src/api/client.ts        API client, backend probe, demo fallback
+  public/demo-data.json    generated snapshot (committed for local builds)
 ```

@@ -29,7 +29,7 @@ export function UploadPanel({ onAnalyzed }: UploadPanelProps) {
   const [frameworks, setFrameworks] = useState<Framework[]>(DEFAULT_FRAMEWORKS);
   const [runMl, setRunMl] = useState(true);
   const [persistGraph, setPersistGraph] = useState(true);
-  const { runUpload, runText, detect, detection, summary, running, error, clear } = useRunAnalysis();
+  const { runUpload, runText, detection, summary, running, error, clear } = useRunAnalysis();
 
   const handleFile = useCallback(
     async (file: File) => {
@@ -39,16 +39,12 @@ export function UploadPanel({ onAnalyzed }: UploadPanelProps) {
         return;
       }
       setFileName(file.name);
-
-      // Fingerprint the vendor first so the operator sees the adapter decision
-      // (and its confidence) before the slower rule-pack run starts.
-      const text = await file.text();
-      await detect(text.slice(0, 200_000));
-
+      // POST /analyze is synchronous and reports which adapter it chose, so the
+      // vendor fingerprint arrives with the results rather than from a probe.
       const result = await runUpload(file);
       if (result) onAnalyzed?.(result);
     },
-    [detect, onAnalyzed, runUpload],
+    [onAnalyzed, runUpload],
   );
 
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
@@ -58,19 +54,14 @@ export function UploadPanel({ onAnalyzed }: UploadPanelProps) {
     if (file) void handleFile(file);
   };
 
-  // The 202 + polling path: useful when the config is already in the database or
-  // arrives from an API push rather than a browser file selection.
+  // Pasted text is submitted through the same endpoint as a file upload, so
+  // this is an alternative way to supply the input, not a second scan path.
   const submitText = async () => {
     setLocalError(null);
     if (configText.trim().length === 0) {
       setLocalError("Paste a configuration first.");
       return;
     }
-    if (frameworks.length === 0) {
-      setLocalError("Select at least one framework to evaluate.");
-      return;
-    }
-    await detect(configText.slice(0, 200_000));
     const result = await runText({
       device_id: deviceId.trim() || "dev-1",
       text: configText,
@@ -301,10 +292,10 @@ export function UploadPanel({ onAnalyzed }: UploadPanelProps) {
 
             <div className="btn-row">
               <button type="button" className="btn primary" disabled={running} onClick={() => void submitText()}>
-                {running ? "Analysis in progress..." : "Queue analysis"}
+                {running ? "Analysis in progress..." : "Scan config text"}
               </button>
               <span className="small dim">
-                Submits to POST /api/v1/analyses and polls the job until it completes.
+                Submitted to POST /api/v1/analyze, which scans synchronously.
               </span>
             </div>
           </div>

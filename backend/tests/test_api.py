@@ -286,6 +286,11 @@ class TestDegradedDatabase:
         r = client.get(f"{PREFIX}/remediations", headers=_auth(admin_token))
         assert r.status_code == 503
 
+    def test_findings_is_503_not_an_empty_list(self, client, admin_token) -> None:
+        r = client.get(f"{PREFIX}/findings", headers=_auth(admin_token))
+        assert r.status_code == 503
+        assert "unavailable" in r.json()["detail"]
+
     def test_scanning_still_works_without_a_database(self, client, admin_token) -> None:
         r = client.post(
             f"{PREFIX}/analyze",

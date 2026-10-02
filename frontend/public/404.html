@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>NETGUARD-AI</title>
+    <script>
+      /*
+       * GitHub Pages serves this file for any path it has no file for. Because it
+       * has no server-side rewrite rules, a hard refresh on a client-side route
+       * like /1s5i5h/findings would otherwise 404 permanently.
+       *
+       * Hand the original URL to the SPA via sessionStorage and boot the app at
+       * the root; main.tsx replays it. sessionStorage (not localStorage) so the
+       * handoff does not outlive the tab.
+       */
+      (function () {
+        try {
+          sessionStorage.setItem("netguard:redirect", window.location.href);
+        } catch (e) {
+          /* Private mode: fall through, the app simply boots at the root. */
+        }
+        window.location.replace("/1s5i5h/");
+      })();
+    </script>
+  </head>
+  <body>
+    <p>Redirecting to the NETGUARD-AI dashboard&hellip;</p>
+    <noscript>
+      NETGUARD-AI needs JavaScript. Enable it and reload this page.
+    </noscript>
+  </body>
+</html>

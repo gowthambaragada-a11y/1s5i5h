@@ -34,6 +34,7 @@ from app.db.models import (
 from app.db.repository import AnalysisMetrics, persist_analysis
 from app.normalize.models import NormalizedConfig, Vendor
 from app.remediation.generator import RemediationGenerator
+from app.schemas.api import Framework, Severity
 
 
 @pytest.fixture
@@ -407,3 +408,110 @@ class TestSchemaGuards:
         with pytest.raises(IntegrityError):
             session.commit()
         session.rollback()
+
+
+class TestFindingsQuery:
+    """The /findings filters, exercised against the real query builder.
+
+    These call the endpoint's own function with a SQLite session, because the
+    filtering and pagination logic is what matters here; the HTTP layer above it
+    is covered in test_api.py.
+    """
+
+    @pytest.fixture
+    def populated(self, session, scan, configs) -> Session:
+        for vendor, cfg in configs.items():
+            result = scan(cfg, f"an-{vendor.value}")
+            persist_analysis(
+                session,
+                analysis_id=f"an-{vendor.value}",
+                cfg=cfg,
+                findings=result.findings,
+                framework_scores=result.scores,
+                remediations=result.plans,
+                metrics=result.metrics,
+            )
+        session.commit()
+        return session
+
+    @staticmethod
+    def _call(session: Session, **kwargs: object):
+        from app.api.v1.endpoints.dashboard import _query_findings
+
+        # Unset filters must be None; the route's own defaults are irrelevant
+        # here because this is the query half of the endpoint.
+        defaults: dict[str, object] = {
+            "severity": None,
+            "status_filter": None,
+            "device_id": None,
+            "framework": None,
+            "limit": 500,
+            "offset": 0,
+        }
+        defaults.update(kwargs)
+        return _query_findings(session, **defaults)
+
+    def test_total_covers_every_match_not_just_the_page(self, populated) -> None:
+        from app.db.models import FindingRow
+
+        expected = populated.query(FindingRow).count()
+        page = self._call(populated, limit=5, offset=0)
+        assert page.total == expected
+        assert len(page.items) == min(5, expected)
+
+    def test_severity_filter_narrows_the_result(self, populated) -> None:
+        from app.db.models import FindingRow
+
+        target = populated.query(FindingRow).first()
+        if target is None:
+            pytest.skip("samples produced no findings")
+        page = self._call(populated, severity=Severity(target.severity))
+        assert page.total >= 1
+        assert all(item.severity == target.severity for item in page.items)
+
+    def test_device_filter_scopes_to_one_device(self, populated) -> None:
+        from app.db.models import FindingRow
+
+        target = populated.query(FindingRow).first()
+        if target is None:
+            pytest.skip("samples produced no findings")
+        page = self._call(populated, device_id=target.device_id)
+        assert page.total >= 1
+        assert {item.device_id for item in page.items} == {target.device_id}
+
+    def test_framework_filter_does_not_duplicate_findings(self, populated) -> None:
+        """A finding can map to several controls of the same framework.
+
+        The join must therefore be deduplicated, or both the total and the page
+        would be inflated by the number of matching controls per finding.
+        """
+        from app.db.models import FindingRow
+
+        linked = populated.query(FindingRow).join(FindingControlRow).first()
+        if linked is None:
+            pytest.skip("no findings are linked to a published control")
+        framework = Framework(linked.controls[0].framework)
+
+        page = self._call(populated, framework=framework)
+        ids = [item.id for item in page.items]
+        assert len(ids) == len(set(ids)), "the framework join duplicated findings"
+        assert page.total == len(ids)
+
+    def test_pagination_walks_the_set_without_overlapping(self, populated) -> None:
+        from app.db.models import FindingRow
+
+        if populated.query(FindingRow).count() < 4:
+            pytest.skip("not enough findings to page through")
+
+        first = self._call(populated, limit=2, offset=0)
+        second = self._call(populated, limit=2, offset=2)
+        assert len(first.items) == 2
+        assert len(second.items) == 2
+        assert {item.id for item in first.items}.isdisjoint({item.id for item in second.items})
+
+    def test_each_finding_carries_its_remediation_id(self, populated) -> None:
+        """The UI links a finding to its generated CLI through this field."""
+        page = self._call(populated)
+        with_plan = [item for item in page.items if item.remediation_id is not None]
+        assert with_plan, "samples should generate at least one remediation"
+        assert all(item.remediation_id for item in with_plan)

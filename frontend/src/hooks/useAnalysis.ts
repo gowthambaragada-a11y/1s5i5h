@@ -2,19 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   approveRemediation,
   describeError,
-  detectVendor,
-  getAnalysis,
   getDashboardSummary,
   getDevice,
   listDevices,
   listFindings,
   listRemediations,
   rejectRemediation,
-  startAnalysis,
   uploadConfig,
 } from "../api/client";
 import type {
-  AnalysisAccepted,
   AnalysisRequest,
   AnalysisSummary,
   DashboardSummary,
@@ -132,10 +128,9 @@ export function useRemediations(
 }
 
 /**
- * Resolves the remediation attached to a finding. The contract exposes no
- * GET /remediations/{id}, so the queue endpoint is filtered by finding_id and
- * matched against the finding's remediation_id. Nothing is fetched until a row
- * is actually expanded.
+ * Resolves the remediation attached to a finding. The queue endpoint is filtered
+ * by finding_id and matched against the finding's remediation_id. Nothing is
+ * fetched until a row is actually expanded.
  */
 export function useRemediationForFinding(
   findingId: string | null,
@@ -218,45 +213,6 @@ export function useRejectRemediation(
 /* Analysis triggering                                                         */
 /* -------------------------------------------------------------------------- */
 
-const POLL_INTERVAL_MS = 1_500;
-const POLL_TIMEOUT_MS = 120_000;
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        window.clearTimeout(timer);
-        reject(new DOMException("aborted", "AbortError"));
-      },
-      { once: true },
-    );
-  });
-}
-
-/**
- * Follows an accepted analysis to completion. `poll_url` comes back as an
- * absolute API path ("/api/v1/analyses/{id}"), which the client would
- * double-prefix, so polling is driven by the analysis id instead.
- */
-async function pollUntilDone(
-  accepted: AnalysisAccepted,
-  signal: AbortSignal,
-): Promise<AnalysisSummary> {
-  const deadline = Date.now() + POLL_TIMEOUT_MS;
-  for (;;) {
-    const summary = await getAnalysis(accepted.analysis_id, signal);
-    if (summary.status === "completed" || summary.status === "failed") return summary;
-    if (Date.now() > deadline) {
-      throw new Error(
-        `Analysis ${accepted.analysis_id} did not finish within ${POLL_TIMEOUT_MS / 1000}s. It is still running; check the dashboard.`,
-      );
-    }
-    await sleep(POLL_INTERVAL_MS, signal);
-  }
-}
-
 export interface RunAnalysisState {
   running: boolean;
   error: string | null;
@@ -287,65 +243,69 @@ export function useRunAnalysis(): RunAnalysisState {
     };
   }, []);
 
-  const runUpload = useCallback(async (file: File) => {
-    setRunning(true);
-    setError(null);
-    try {
-      const result = await uploadConfig(file);
-      if (!mounted.current) return null;
-      setSummary(result);
-      setDeviceId(result.device_id);
-      setDetection({
-        vendor: result.vendor,
-        confidence: result.vendor_confidence,
-        rule_pack: null,
-        candidates: [],
-        evidence_precision: result.evidence_precision,
-      });
-      return result;
-    } catch (cause) {
-      if (mounted.current) setError(describeError(cause));
-      return null;
-    } finally {
-      if (mounted.current) setRunning(false);
-    }
+  /**
+   * Shared post-response bookkeeping: the API returns the detected vendor with
+   * the summary, so there is no separate fingerprint call to make beforehand.
+   */
+  const adopt = useCallback((result: AnalysisSummary) => {
+    if (!mounted.current) return null;
+    setSummary(result);
+    setDeviceId(result.device_id);
+    setDetection({
+      vendor: result.vendor,
+      confidence: result.vendor_confidence,
+      rule_pack: null,
+      candidates: [],
+      evidence_precision: result.evidence_precision,
+    });
+    return result;
   }, []);
 
-  const runText = useCallback(async (payload: AnalysisRequest) => {
-    setRunning(true);
-    setError(null);
-    setDeviceId(payload.device_id);
-    try {
-      const accepted = await startAnalysis(payload);
-      const result = await pollUntilDone(accepted, new AbortController().signal);
-      if (!mounted.current) return null;
-      setSummary(result);
-      setDetection({
-        vendor: result.vendor,
-        confidence: result.vendor_confidence,
-        rule_pack: null,
-        candidates: [],
-        evidence_precision: result.evidence_precision,
-      });
-      return result;
-    } catch (cause) {
-      if (mounted.current) setError(describeError(cause));
-      return null;
-    } finally {
-      if (mounted.current) setRunning(false);
-    }
-  }, []);
+  const runUpload = useCallback(
+    async (file: File) => {
+      setRunning(true);
+      setError(null);
+      try {
+        return adopt(await uploadConfig(file));
+      } catch (cause) {
+        if (mounted.current) setError(describeError(cause));
+        return null;
+      } finally {
+        if (mounted.current) setRunning(false);
+      }
+    },
+    [adopt],
+  );
 
-  const detect = useCallback(async (text: string) => {
-    setError(null);
-    try {
-      const result = await detectVendor({ text });
-      if (mounted.current) setDetection(result);
-      return result;
-    } catch (cause) {
-      if (mounted.current) setError(describeError(cause));
-      return null;
-    }
+  /**
+   * Pasted config text goes through the same upload endpoint as a file.
+   *
+   * The API takes multipart file uploads and scans synchronously, so there is no
+   * separate text or job-queue route to call; wrapping the text in a Blob keeps
+   * one code path instead of maintaining a second submit flow that cannot work.
+   */
+  const runText = useCallback(
+    async (payload: AnalysisRequest) => {
+      setRunning(true);
+      setError(null);
+      const name = `${payload.device_id.trim() || "device"}.cfg`;
+      const file = new File([payload.text], name, { type: "text/plain" });
+      try {
+        return adopt(await uploadConfig(file));
+      } catch (cause) {
+        if (mounted.current) setError(describeError(cause));
+        return null;
+      } finally {
+        if (mounted.current) setRunning(false);
+      }
+    },
+    [adopt],
+  );
+
+  const detect = useCallback(async () => {
+    // Detection is not a separate endpoint: POST /analyze reports the vendor it
+    // chose. Exposed as a no-op so the panel can stay vendor-agnostic.
+    return null;
   }, []);
 
   const clear = useCallback(() => {

@@ -1,5 +1,6 @@
 import { useNavigate } from "react-router-dom";
 import type { Framework, Severity } from "../types/api";
+import { isReadOnly } from "../api/client";
 import { useDashboardSummary } from "../hooks/useAnalysis";
 import {
   SEVERITIES,
@@ -77,7 +78,9 @@ export function DashboardPage() {
           />
         </div>
 
-        <UploadPanel onAnalyzed={reload} />
+        {/* Scanning needs a live backend, so the panel is hidden in static demo
+            mode rather than left as a control that cannot work. */}
+        {!isReadOnly() && <UploadPanel onAnalyzed={reload} />}
 
         <div className="grid-2">
           <div className="card">

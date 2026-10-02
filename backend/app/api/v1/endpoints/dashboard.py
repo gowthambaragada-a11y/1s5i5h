@@ -9,20 +9,26 @@ should not be mistaken for a clean one.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.api.deps import AnalystDep
 from app.db import repository
 from app.db.graph import SecurityGraph
-from app.db.models import AnalysisRow, DeviceRow, FindingRow
+from app.db.models import AnalysisRow, DeviceRow, FindingControlRow, FindingRow
 from app.db.session import session_scope, unavailable_reason
 from app.schemas.api import (
+    ControlRef,
     DashboardSummary,
+    Detector,
     DeviceCompliance,
+    EvidenceLine,
+    Finding,
+    FindingStatus,
     Framework,
     FrameworkScore,
+    Paged,
     Severity,
     TopRiskyRule,
     Vendor,
@@ -168,8 +174,112 @@ def _top_risky(session, top: int) -> list[TopRiskyRule]:
     ]
 
 
-def _vendor(value: str | None):
+@router.get("/findings", response_model=Paged[Finding])
+def list_findings(
+    _user: AnalystDep,
+    severity: Annotated[Severity | None, Query()] = None,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+    device_id: str | None = None,
+    framework: Annotated[Framework | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Paged[Finding]:
+    """Fleet-wide findings, filtered and paginated."""
+    with session_scope() as session:
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"findings unavailable: {unavailable_reason() or 'postgres unreachable'}",
+            )
+        return _query_findings(
+            session,
+            severity=severity,
+            status_filter=status_filter,
+            device_id=device_id,
+            framework=framework,
+            limit=limit,
+            offset=offset,
+        )
 
+
+def _query_findings(
+    session: Any,
+    *,
+    severity: Severity | None,
+    status_filter: str | None,
+    device_id: str | None,
+    framework: Framework | None,
+    limit: int,
+    offset: int,
+) -> Paged[Finding]:
+    """Filter and page findings against an open session.
+
+    Split out from the route so the query itself can be tested against SQLite,
+    which is the only database available without Postgres running.
+    """
+    query = session.query(FindingRow)
+    if severity is not None:
+        query = query.filter(FindingRow.severity == str(severity))
+    if status_filter is not None:
+        query = query.filter(FindingRow.status == status_filter)
+    if device_id:
+        query = query.filter(FindingRow.device_id == device_id)
+
+    if framework is not None:
+        # Filtered through the join table rather than a JSON column so the
+        # database does the matching instead of loading every finding.
+        query = query.join(
+            FindingControlRow,
+            FindingControlRow.finding_id == FindingRow.id,
+        ).filter(FindingControlRow.framework == str(framework))
+        # A finding can map to several controls of the same framework; the join
+        # would otherwise duplicate rows and inflate both total and page.
+        query = query.distinct()
+
+    # Counted before slicing, so total describes the whole match set rather than
+    # the current page; the UI needs it to size the pager.
+    total = query.count()
+    rows = (
+        query.order_by(FindingRow.severity, FindingRow.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return Paged(
+        items=[_finding(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def _finding(row: FindingRow) -> Finding:
+    """Rebuild the wire shape, including the finding's remediation id."""
+    return Finding(
+        id=row.id,
+        analysis_id=row.analysis_id,
+        device_id=row.device_id,
+        rule_id=row.rule_id,
+        title=row.title,
+        description=row.description,
+        explanation=row.explanation,
+        severity=Severity(row.severity),
+        confidence=row.confidence,
+        status=FindingStatus(row.status),
+        category=row.category,
+        controls=[
+            ControlRef(framework=Framework(c.framework), control_id=c.control_id, title=c.title)
+            for c in row.controls
+        ],
+        evidence=[EvidenceLine(line_no=e.line_no, raw=e.raw) for e in row.evidence],
+        evidence_precision=row.evidence_precision,  # type: ignore[arg-type]
+        detector=Detector(row.detector),
+        created_at=row.created_at,
+        remediation_id=row.remediation.id if row.remediation else None,
+    )
+
+
+def _vendor(value: str | None):
     try:
         return Vendor(value) if value else Vendor.UNKNOWN
     except ValueError:

@@ -1,6 +1,4 @@
 import type {
-  AnalysisAccepted,
-  AnalysisRequest,
   AnalysisSummary,
   DashboardSummary,
   DeviceCompliance,
@@ -11,11 +9,13 @@ import type {
   Remediation,
   RemediationQuery,
   VendorDetection,
-  VendorDetectRequest,
 } from "../types/api";
 
 /** Base URL of the backend. Empty string means "same origin", which the dev server proxies. */
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
+
+/** Resolved against Vite's `base` so the subpath deploy fetches correctly. */
+const DEMO_DATA_URL = `${import.meta.env.BASE_URL}demo-data.json`;
 
 const configuredTimeout = Number(import.meta.env.VITE_API_TIMEOUT_MS);
 const DEFAULT_TIMEOUT_MS =
@@ -54,6 +54,131 @@ export class ApiError extends Error {
   get isNetworkError(): boolean {
     return this.status === 0;
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Static-demo fallback                                                        */
+/* -------------------------------------------------------------------------- */
+
+interface DemoDataset {
+  dashboard: DashboardSummary;
+  devices: DeviceCompliance[];
+  findings: Finding[];
+  remediations: Remediation[];
+}
+
+let demoCache: DemoDataset | null = null;
+let demoUnavailable = false;
+
+/**
+ * True once any read has fallen back to the bundled snapshot. Drives the banner
+ * so a static deployment cannot be mistaken for a live one.
+ */
+let usingDemoData = false;
+
+/** True when the app is serving the static snapshot, so writes must be refused. */
+export function isReadOnly(): boolean {
+  return usingDemoData;
+}
+
+const demoModeListeners = new Set<() => void>();
+
+/**
+ * Notifies when the app drops into demo mode.
+ *
+ * The first successful read decides this, which happens after the initial
+ * render, so a component cannot read the flag synchronously. Subscribing avoids
+ * polling on a timer and re-renders only the components that care.
+ */
+export function onDemoModeChange(listener: () => void): () => void {
+  demoModeListeners.add(listener);
+  return () => {
+    demoModeListeners.delete(listener);
+  };
+}
+
+async function loadDemoData(): Promise<DemoDataset | null> {
+  if (demoCache !== null || demoUnavailable) return demoCache;
+  try {
+    const response = await fetch(DEMO_DATA_URL, { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error(`demo snapshot returned ${response.status}`);
+    demoCache = (await response.json()) as DemoDataset;
+  } catch {
+    // The snapshot is itself optional; without it the real error stands.
+    demoUnavailable = true;
+    return null;
+  }
+  return demoCache;
+}
+
+/**
+ * Decides once, up front, whether a real backend is serving this origin.
+ *
+ * Inferring this from a failed data request is unreliable: on GitHub Pages an
+ * `/api/v1/...` path is answered by our own 404.html with status 404 and an HTML
+ * body, which is indistinguishable from a genuine "not found" unless you inspect
+ * the body. So we ask the one endpoint that must answer if a backend is really
+ * there -- `/healthz`, which touches no dependency -- and commit to the answer
+ * for the session.
+ *
+ * Any outcome other than a well-formed health response means "no backend":
+ * unreachable, HTML instead of JSON, an auth challenge, a 404 from the static
+ * host. In that case reads are served from the snapshot and writes are refused.
+ */
+async function detectBackend(): Promise<boolean> {
+  try {
+    const response = await fetch(`${BASE_URL}${API_PREFIX}/healthz`, {
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) return false;
+    const contentType = response.headers.get("content-type") ?? "";
+    // A static host answering 404.html with 200-ish behaviour still lands here;
+    // requiring JSON keeps an HTML body from being read as a healthy API.
+    if (!contentType.includes("application/json")) return false;
+    const body = (await response.json()) as { status?: string; service?: string };
+    return body?.status === "ok" && body?.service === "netguard-ai";
+  } catch {
+    return false;
+  }
+}
+
+let backendAvailable: Promise<boolean> | null = null;
+
+function backendIsAvailable(): Promise<boolean> {
+  // Memoised so concurrent first-load requests trigger a single probe.
+  backendAvailable ??= detectBackend();
+  return backendAvailable;
+}
+
+function enterDemoMode(): void {
+  if (usingDemoData) return;
+  usingDemoData = true;
+  for (const listener of demoModeListeners) listener();
+}
+
+/**
+ * Runs the real request when a backend is present, otherwise serves the bundled
+ * snapshot.
+ *
+ * The snapshot is real pipeline output over the sample configs, produced by
+ * `backend/scripts/export_demo_data.py` -- not hand-written numbers. Once a
+ * backend has been detected, genuine failures (401/403/404 from a real server)
+ * propagate as errors instead of being masked with sample data.
+ */
+async function withDemoFallback<T>(run: () => Promise<T>, demo: (data: DemoDataset) => T): Promise<T> {
+  if (await backendIsAvailable()) return run();
+
+  const data = await loadDemoData();
+  if (!data) {
+    throw new ApiError({
+      status: 0,
+      detail:
+        "No NETGUARD-AI backend is reachable and the bundled demo snapshot could not be loaded.",
+      url: DEMO_DATA_URL,
+    });
+  }
+  enterDemoMode();
+  return demo(data);
 }
 
 /** Aborts the underlying fetch when the server takes too long to answer. */
@@ -197,10 +322,12 @@ function post<T>(path: string, payload: unknown, signal?: AbortSignal): Promise<
 /* Analyses                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/** Scanning is synchronous on the server: the summary comes back in one response. */
 export function uploadConfig(file: File, signal?: AbortSignal): Promise<AnalysisSummary> {
+  if (usingDemoData) return Promise.reject(uploadUnavailable());
   const form = new FormData();
   form.append("file", file);
-  return request<AnalysisSummary>("/analyses/upload", {
+  return request<AnalysisSummary>("/analyze", {
     method: "POST",
     body: form,
     // Uploads can be several megabytes; give them a longer budget than reads.
@@ -209,12 +336,30 @@ export function uploadConfig(file: File, signal?: AbortSignal): Promise<Analysis
   });
 }
 
-export function detectVendor(payload: VendorDetectRequest, signal?: AbortSignal): Promise<VendorDetection> {
-  return post<VendorDetection>("/analyses/detect-vendor", payload, signal);
+/** The API returns every supported adapter, each already normalised. */
+export function listSupportedVendors(signal?: AbortSignal): Promise<VendorDetection[]> {
+  return withDemoFallback(
+    () => request<VendorDetection[]>("/vendors", { signal }),
+    // Demo mode has no adapter catalogue to report, so derive it from the
+    // vendors actually present in the snapshot.
+    (data) =>
+      [...new Set(data.devices.map((device) => device.vendor))].map((vendor) => ({
+        vendor: vendor as VendorDetection["vendor"],
+        confidence: 1,
+        rule_pack: null,
+        candidates: [],
+        evidence_precision: "block" as const,
+      })),
+  );
 }
 
-export function startAnalysis(payload: AnalysisRequest, signal?: AbortSignal): Promise<AnalysisAccepted> {
-  return post<AnalysisAccepted>("/analyses", payload, signal);
+function uploadUnavailable(): ApiError {
+  return new ApiError({
+    status: 0,
+    detail:
+      "Scanning a configuration needs a running NETGUARD-AI backend. This page is showing a static snapshot of the bundled sample configurations.",
+    url: "(demo-mode)",
+  });
 }
 
 export function getAnalysis(analysisId: string, signal?: AbortSignal): Promise<AnalysisSummary> {
@@ -226,53 +371,152 @@ export function getAnalysis(analysisId: string, signal?: AbortSignal): Promise<A
 /* -------------------------------------------------------------------------- */
 
 export function getDashboardSummary(signal?: AbortSignal): Promise<DashboardSummary> {
-  return request<DashboardSummary>("/dashboard/summary", { signal });
+  return withDemoFallback(
+    () => request<DashboardSummary>("/dashboard", { signal }),
+    (data) => data.dashboard,
+  );
 }
 
 export function listFindings(query: FindingQuery = {}, signal?: AbortSignal): Promise<Paged<Finding>> {
-  return request<Paged<Finding>>(`/findings${buildQuery({ ...query })}`, { signal });
+  return withDemoFallback(
+    () => request<Paged<Finding>>(`/findings${buildQuery({ ...query })}`, { signal }),
+    (data) => filterDemoFindings(data, query),
+  );
+}
+
+/** Applies the same filters the API would, so demo mode honours the query UI. */
+function filterDemoFindings(data: DemoDataset, query: FindingQuery): Paged<Finding> {
+  const { severity, framework, device_id, status, limit = 50, offset = 0 } = query;
+  let items = data.findings;
+  if (severity) items = items.filter((f) => f.severity === severity);
+  if (status) items = items.filter((f) => f.status === status);
+  if (device_id) items = items.filter((f) => f.device_id === device_id);
+  if (framework) {
+    items = items.filter((f) => f.controls.some((c) => c.framework === framework));
+  }
+  return { items: items.slice(offset, offset + limit), total: items.length, limit, offset };
 }
 
 export function listDevices(signal?: AbortSignal): Promise<{ items: DeviceCompliance[]; total: number }> {
-  return request<{ items: DeviceCompliance[]; total: number }>("/devices", { signal });
+  return withDemoFallback(
+    // The API answers with a bare array; normalise to the paged shape the UI uses.
+    async () => {
+      const devices = await request<DeviceCompliance[]>("/devices", { signal });
+      return { items: devices, total: devices.length };
+    },
+    (data) => ({ items: data.devices, total: data.devices.length }),
+  );
 }
 
 export function getDevice(deviceId: string, signal?: AbortSignal): Promise<DeviceCompliance> {
-  return request<DeviceCompliance>(`/devices/${encodeURIComponent(deviceId)}`, { signal });
+  return withDemoFallback(
+    () => request<DeviceCompliance>(`/devices/${encodeURIComponent(deviceId)}`, { signal }),
+    (data) => {
+      const found = data.devices.find((d) => d.device_id === deviceId);
+      if (!found) throw new ApiError({ status: 404, detail: `device ${deviceId} not found`, url: deviceId });
+      return found;
+    },
+  );
 }
 
 /* -------------------------------------------------------------------------- */
 /* Remediation review queue                                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The API nests the plan under `plan` and repeats finding metadata alongside
+ * it, because the queue view needs the severity without a second request. The
+ * UI wants one flat row, so flatten on the way in.
+ */
+interface RemediationDetail {
+  plan: Omit<Remediation, "finding_id" | "reviewed_by" | "reviewed_at" | "review_note"> & {
+    finding_id: string;
+    reviewed_by?: string | null;
+    reviewed_at?: string | null;
+    review_note?: string | null;
+  };
+  finding_id: string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  review_note: string | null;
+}
+
+function flattenRemediation(detail: RemediationDetail): Remediation {
+  return {
+    ...detail.plan,
+    finding_id: detail.finding_id,
+    reviewed_by: detail.reviewed_by,
+    reviewed_at: detail.reviewed_at,
+    review_note: detail.review_note,
+  };
+}
+
 export function listRemediations(
   query: RemediationQuery = {},
   signal?: AbortSignal,
 ): Promise<{ items: Remediation[]; total: number }> {
-  return request<{ items: Remediation[]; total: number }>(
-    `/remediations${buildQuery({ ...query })}`,
-    { signal },
+  return withDemoFallback(
+    async () => {
+      // The API filters by status server-side but has no finding_id filter, so
+      // that one is applied here to keep both paths behaving the same.
+      const rows = await request<RemediationDetail[]>(
+        `/remediations${buildQuery({ status: query.status })}`,
+        { signal },
+      );
+      const items = rows
+        .map(flattenRemediation)
+        .filter((item) => !query.finding_id || item.finding_id === query.finding_id);
+      return { items, total: items.length };
+    },
+    (data) => {
+      const { status, finding_id } = query;
+      let items = data.remediations;
+      if (status) items = items.filter((r) => r.status === status);
+      if (finding_id) items = items.filter((r) => r.finding_id === finding_id);
+      return { items, total: items.length };
+    },
   );
 }
 
-export function approveRemediation(remediationId: string, signal?: AbortSignal): Promise<Remediation> {
-  return post<Remediation>(
-    `/remediations/${encodeURIComponent(remediationId)}/approve`,
-    {},
+/**
+ * Review actions are unavailable in demo mode.
+ *
+ * Approving a proposal against a static snapshot would be a lie: there is no
+ * server holding the decision, so the UI must not pretend one was recorded.
+ */
+export async function approveRemediation(
+  remediationId: string,
+  signal?: AbortSignal,
+): Promise<Remediation> {
+  if (!(await backendIsAvailable())) return Promise.reject(reviewUnavailable("Approving"));
+  const detail = await post<RemediationDetail>(
+    `/remediations/${encodeURIComponent(remediationId)}/review`,
+    { decision: "approved" },
     signal,
   );
+  return flattenRemediation(detail);
 }
 
-export function rejectRemediation(
+export async function rejectRemediation(
   remediationId: string,
   payload: RejectRequest,
   signal?: AbortSignal,
 ): Promise<Remediation> {
-  return post<Remediation>(
-    `/remediations/${encodeURIComponent(remediationId)}/reject`,
-    payload,
+  if (!(await backendIsAvailable())) return Promise.reject(reviewUnavailable("Rejecting"));
+  const detail = await post<RemediationDetail>(
+    `/remediations/${encodeURIComponent(remediationId)}/review`,
+    { decision: "rejected", note: payload.reason },
     signal,
   );
+  return flattenRemediation(detail);
+}
+
+function reviewUnavailable(action: string): ApiError {
+  return new ApiError({
+    status: 0,
+    detail: `${action} a remediation needs a running NETGUARD-AI backend. This page is showing a static snapshot of real analysis results.`,
+    url: "(demo-mode)",
+  });
 }
 
 /** Human-facing message for any thrown value, safe to render directly. */
