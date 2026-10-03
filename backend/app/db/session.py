@@ -13,7 +13,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -26,18 +26,20 @@ _engine: Engine | None = None
 _SessionFactory: sessionmaker[Session] | None = None
 _unavailable_reason: str | None = None
 
+#: Probed to decide whether the schema is actually there. Every other table is
+#: created in the same `create_all` call, so its absence means none of them are.
+_SCHEMA_PROBE_TABLE = "users"
 
-def get_engine() -> Engine | None:
-    """Lazily build the engine. Returns ``None`` if the DSN is unusable."""
-    global _engine, _unavailable_reason
-    if _engine is not None:
-        return _engine
-    if _unavailable_reason is not None:
-        return None
 
+def _build_engine() -> Engine | None:
+    """Construct the engine. Returns ``None`` if the DSN or driver is unusable.
+
+    Deliberately does *not* check the schema: `create_all` needs a raw engine to
+    create the schema in the first place.
+    """
     settings = get_settings()
     try:
-        _engine = create_engine(
+        return create_engine(
             settings.postgres_dsn,
             echo=settings.db_echo,
             pool_pre_ping=True,
@@ -52,6 +54,53 @@ def get_engine() -> Engine | None:
         _unavailable_reason = f"could not build engine: {type(exc).__name__}: {exc}"
         logger.warning("postgres unavailable: %s", _unavailable_reason)
         return None
+
+
+def _schema_exists(engine: Engine) -> bool:
+    """Whether the application tables have been created.
+
+    This check is the reason a freshly provisioned Postgres does not turn every
+    endpoint into a 500. A brand-new Neon or Supabase project accepts connections
+    immediately, so a bare ``SELECT 1`` probe reports "available" and the first
+    real query fails with ``relation "users" does not exist`` -- surfacing to an
+    operator as an internal server error instead of the 503 that every caller
+    already knows how to handle.
+    """
+    try:
+        # `has_table` rather than a probe query: it is a metadata lookup, and it
+        # needs no SQL string at all.
+        return bool(inspect(engine).has_table(_SCHEMA_PROBE_TABLE))
+    except SQLAlchemyError:
+        return False
+
+
+def get_engine() -> Engine | None:
+    """Lazily build the engine. ``None`` when Postgres is unusable.
+
+    "Unusable" covers a bad DSN, a missing driver, and a reachable database with
+    no schema -- all three mean the same thing to a caller, which cannot do any
+    of the work it was asked for.
+    """
+    global _engine, _unavailable_reason
+    if _engine is not None:
+        return _engine
+    if _unavailable_reason is not None:
+        return None
+
+    engine = _build_engine()
+    if engine is None:
+        return None
+
+    if not _schema_exists(engine):
+        _unavailable_reason = (
+            f"connected to postgres but table '{_SCHEMA_PROBE_TABLE}' is missing; "
+            "run 'python -m scripts.create_operator' to create the schema"
+        )
+        engine.dispose()
+        logger.warning("postgres schema missing: %s", _unavailable_reason)
+        return None
+
+    _engine = engine
     return _engine
 
 
@@ -89,7 +138,7 @@ def session_scope() -> Iterator[Session | None]:
 
 
 def is_available() -> bool:
-    """True when a trivial round-trip to Postgres succeeds."""
+    """True when Postgres is reachable *and* the schema exists."""
     engine = get_engine()
     if engine is None:
         return False
@@ -103,18 +152,25 @@ def is_available() -> bool:
 
 
 def unavailable_reason() -> str | None:
-    """Why the database is unavailable, for surfacing on ``/healthz``."""
+    """Why the database is unavailable, for surfacing on ``/readyz``."""
     return _unavailable_reason
 
 
 def create_all(engine: Engine | None = None) -> bool:
-    """Create the schema. Returns False when there is no database to create it in."""
-    target = engine or get_engine()
+    """Create the schema. Returns False when there is no database to create it in.
+
+    Builds a raw engine when none is given, bypassing the schema check in
+    :func:`get_engine` -- otherwise the database could never be initialised,
+    since a missing schema is exactly what this is called to fix.
+    """
+    target = engine or _build_engine()
     if target is None:
         return False
     from app.db.models import Base
 
     Base.metadata.create_all(target)
+    # `get_engine` may already have cached "unusable" from an earlier probe.
+    reset_state()
     return True
 
 

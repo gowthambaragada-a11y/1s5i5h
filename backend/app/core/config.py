@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     secret_key: str = Field(default="dev-only-insecure-key-change-me", min_length=16)
     jwt_algorithm: str = "HS256"
     access_token_ttl_minutes: int = 60
+    # The built-in operator accounts exist so the demo works with no database.
+    # They are a fixed set of published passwords, so they must not survive into
+    # a public deployment: anyone who reads the repository could otherwise log
+    # in as an admin. See `_reject_demo_accounts_in_prod`.
+    allow_demo_accounts: bool = True
     # Argon2id parameters for the local operator accounts.
     pwd_hash_time_cost: int = 3
     pwd_hash_memory_cost_kib: int = 64_536
@@ -73,6 +78,12 @@ class Settings(BaseSettings):
     anomaly_contamination: float = Field(default=0.05, gt=0.0, lt=0.5)
     anomaly_min_samples: int = 25
 
+    # Read from the environment as a JSON array, e.g.
+    #   CORS_ORIGINS='["https://example.github.io"]'
+    # pydantic-settings JSON-decodes complex-typed fields *before* any validator
+    # runs, so a comma-separated value here aborts startup with a JSONDecodeError
+    # rather than reaching `_split_origins`. The validator below still handles
+    # comma-separated strings passed directly to the constructor.
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     @field_validator("cors_origins", mode="before")
@@ -82,11 +93,34 @@ class Settings(BaseSettings):
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
 
-    @field_validator("environment", mode="after")
-    def _reject_dev_secrets_in_prod(cls, v: str, info) -> str:
-        if v == "prod" and info.data.get("secret_key", "").startswith("dev-only"):
+    @model_validator(mode="after")
+    def _reject_dev_secrets_in_prod(self) -> Settings:
+        """A prod deployment must not run on the committed placeholder values.
+
+        Checked here rather than in a field validator because a field validator
+        only sees fields declared *before* it, and `environment` is declared first
+        -- so a per-field check would silently never see `secret_key` and would
+        never fire.
+        """
+        if self.environment == "prod" and self.secret_key.startswith("dev-only"):
             raise ValueError("secret_key must be set from the environment when environment=prod")
-        return v
+        return self
+
+    @model_validator(mode="after")
+    def _reject_demo_accounts_in_prod(self) -> Settings:
+        """A public deployment must not ship the built-in operator passwords.
+
+        They are deliberately weak and documented, so leaving them enabled on a
+        public URL is the same as leaving a default admin password in place. The
+        failure is at startup rather than at first login, so it cannot be missed
+        once the service is already serving.
+        """
+        if self.environment == "prod" and self.allow_demo_accounts:
+            raise ValueError(
+                "allow_demo_accounts must be false when environment=prod; "
+                "the built-in admin/analyst/viewer passwords are public"
+            )
+        return self
 
     @property
     def is_production(self) -> bool:

@@ -1,0 +1,57 @@
+# Render Blueprint for the NETGUARD-AI API.
+#
+# Deploy with: Render dashboard -> New -> Blueprint -> point at this repository.
+#
+# The database is deliberately *not* declared here. Render's free Postgres
+# instance has a 30-day expiry, and an auto-expiring store means the demo loses
+# its history without warning. Provision Postgres separately (Neon or Supabase
+# both have a permanent free tier) and paste the URL into POSTGRES_DSN below.
+#
+# Values left as sync:false are prompted for at deploy time rather than being
+# committed, so no secret ever enters git history.
+
+services:
+  - type: web
+    name: netguard-ai-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install --upgrade pip && pip install .
+    # Procfile supplies this; it is repeated here so the service still starts if
+    # the Procfile is ever renamed. Uvicorn must bind 0.0.0.0 and read $PORT or
+    # Render reports the service as unhealthy.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 65
+    healthCheckPath: /api/v1/healthz
+    # Free instances sleep after 15 minutes of inactivity, so the first request
+    # after a lull takes ~30s. The frontend's 10s timeout is lower than that on
+    # purpose: a visible retry beats a spinner that never resolves.
+    autoDeploy: true
+    envVars:
+      # Must be exactly "prod" -- Settings types this as a Literal, so
+      # "production" fails validation and the service crash-loops at startup.
+      - key: ENVIRONMENT
+        value: prod
+      - key: SECRET_KEY
+        generateValue: true
+      # Required false. The service refuses to start if this is left on, because
+      # the built-in admin/analyst/viewer passwords are published in the README.
+      - key: ALLOW_DEMO_ACCOUNTS
+        value: "false"
+      - key: ACCESS_TOKEN_TTL_MINUTES
+        value: "60"
+      # Postgres from Neon/Supabase. Must be the postgresql+psycopg:// form.
+      - key: POSTGRES_DSN
+        sync: false
+      # JSON array, exact origins, no trailing slash. See docs/deployment.md.
+      - key: CORS_ORIGINS
+        value: '["https://gowthambaragada-a11y.github.io"]'
+      # Optional: omit both to skip the Neo4j graph and its /graph endpoint.
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USER
+        sync: false
+      - key: NEO4J_PASSWORD
+        sync: false
+      # Optional LLM narrative; the pipeline runs without it.
+      - key: LLM_API_KEY
+        sync: false

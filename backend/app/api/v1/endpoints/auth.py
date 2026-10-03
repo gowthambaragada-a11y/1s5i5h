@@ -13,13 +13,18 @@ from typing import cast
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import SettingsDep, UserDep
+from app.core.config import Settings
+from app.core.logging import get_logger
 from app.core.security import Role, create_access_token, hash_password, verify_password
 from app.db.models import UserRow
 from app.db.session import is_available, session_scope
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+logger = get_logger(__name__)
 
 
 class LoginRequest(BaseModel):
@@ -55,7 +60,7 @@ def _demo_users() -> dict[str, tuple[str, str]]:
     return _DEMO_USERS
 
 
-def _lookup(username: str) -> tuple[str, str] | None:
+def _lookup(username: str, settings: Settings) -> tuple[str, str] | None:
     """Find ``(password_hash, role)``. Falls back to demo accounts.
 
     A disabled account is treated as absent: returning its role would let the
@@ -63,9 +68,21 @@ def _lookup(username: str) -> tuple[str, str] | None:
     """
     with session_scope() as session:
         if session is not None:
-            row = session.query(UserRow).filter(UserRow.username == username).first()
+            try:
+                row = session.query(UserRow).filter(UserRow.username == username).first()
+            except SQLAlchemyError:
+                # `session_scope` only yields None when the engine could not be
+                # built. A database that connects but has no schema still opens a
+                # session and then fails on the query, which would make login the
+                # one endpoint that returns 500 instead of 401. Degrade to the
+                # no-accounts answer: the login attempt fails, and /readyz
+                # reports the real reason.
+                logger.warning("users table unusable; treating as no operator accounts", exc_info=True)
+                row = None
             if row is not None and not row.disabled:
                 return (row.password_hash, row.role)
+    if not settings.allow_demo_accounts:
+        return None
     return _demo_users().get(username)
 
 
@@ -85,7 +102,7 @@ def create_user(username: str, password: str, role: str) -> str:
 
 @router.post("/login", response_model=TokenResponse)
 def login(payload: LoginRequest, settings: SettingsDep) -> TokenResponse:
-    entry = _lookup(payload.username)
+    entry = _lookup(payload.username, settings)
     # Always run a verification so a missing user and a wrong password cost the
     # same time; otherwise response latency enumerates valid usernames.
     encoded = entry[0] if entry else "x" * 64
@@ -118,6 +135,11 @@ def _as_role(value: str) -> Role:
 
 
 @router.get("/auth-status")
-def auth_status() -> dict[str, object]:
+def auth_status(settings: SettingsDep) -> dict[str, object]:
     """Whether real accounts are in play. Lets the UI warn before a demo login."""
-    return {"users_table_available": is_available(), "demo_accounts": not is_available()}
+    return {
+        "users_table_available": is_available(),
+        # Demo logins work whenever the flag is on, regardless of the database:
+        # the built-in accounts are the fallback, not the exception.
+        "demo_accounts": settings.allow_demo_accounts,
+    }

@@ -1,0 +1,9 @@
+# --- Runtime ---------------------------------------------------------------
+# Render/Railway/Koyeb run this as a web service. One worker by design: the
+# pipeline caches a fitted baseline in-process, and a second worker would build
+# its own. Scale out with more instances, not more uvicorn workers.
+web: uvicorn app.main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 65
+
+# Releases run against a build-time $PORT that is not the runtime one, so this
+# is only useful for explicit migrations on a real instance:
+# release: alembic upgrade head

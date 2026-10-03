@@ -47,7 +47,14 @@ def main() -> int:
     configs = []
     for vendor, name in VENDOR_SAMPLES.items():
         raw = (SAMPLES / name).read_text(encoding="utf-8")
-        adapter, confidence, _ = registry.detect(raw)
+        adapter, confidence, scores = registry.detect(raw)
+        if adapter is None:
+            # `detect` returns None when nothing clears its confidence threshold,
+            # which happens if a sample or a `supports()` heuristic is edited. Say
+            # which vendor and how close it got, rather than crashing later on a
+            # NoneType somewhere further down the pipeline.
+            table = ", ".join(f"{n}={s}" for n, s in scores[:3])
+            sys.exit(f"could not detect the {vendor.value} sample {name} (best: {table or 'no normalizers'})")
         cfg = adapter.run(raw, device_id=f"dev-{vendor.value}")
         cfg.detected_vendor_confidence = confidence
         configs.append(cfg)

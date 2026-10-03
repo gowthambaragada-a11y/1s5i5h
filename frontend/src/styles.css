@@ -1313,3 +1313,29 @@ tr.row-expanded {
 .recharts-tooltip-label {
   color: var(--text-muted) !important;
 }
+/* -------------------------------------------------------------------------- */
+/* Sign-in                                                                       */
+/* -------------------------------------------------------------------------- */
+
+/* Centred on the page background rather than inside .app-shell: the login card
+   is the whole page for an unauthenticated visitor, so the sidebar would be
+   empty navigation pointing at routes they cannot open. */
+.login-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 420px;
+}
+
+.login-card code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 12px;
+}

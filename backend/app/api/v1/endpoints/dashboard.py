@@ -1,9 +1,14 @@
 """Dashboard and fleet endpoints.
 
 The dashboard aggregates across devices, which is the one question the
-per-device pipeline cannot answer on its own. Without Postgres it reports zeros
-*and* an explicit ``degraded`` flag, because a dashboard showing an empty fleet
-should not be mistaken for a clean one.
+per-device pipeline cannot answer on its own.
+
+Every route here is database-backed, and every one of them answers 503 when the
+database is unusable rather than returning an empty result. A dashboard showing
+"0 devices, score 0.0" reads as a clean fleet, and for a security tool that is
+the most dangerous thing this API could say: an operator would see a green
+dashboard on a deployment whose Postgres is unreachable or unmigrated, and
+conclude there is nothing to fix.
 """
 
 from __future__ import annotations
@@ -41,18 +46,9 @@ router = APIRouter(tags=["dashboard"])
 def dashboard(_user: AnalystDep, top: Annotated[int, Query(ge=1, le=50)] = 10) -> DashboardSummary:
     with session_scope() as session:
         if session is None:
-            # Honest empty state: zeroes, plus the reason they are zero.
-            return DashboardSummary(
-                generated_at=datetime.now(UTC),
-                total_devices=0,
-                total_findings=0,
-                overall_score=0.0,
-                severity_counts={},
-                framework_scores=[],
-                devices=[],
-                pending_remediations=0,
-                critical_delta=0,
-                top_risky_rules=[],
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"dashboard unavailable: {unavailable_reason() or 'postgres unreachable'}",
             )
 
         analyses = session.query(AnalysisRow).order_by(AnalysisRow.created_at.desc()).all()

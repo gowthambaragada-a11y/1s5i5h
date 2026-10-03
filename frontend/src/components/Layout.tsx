@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import { apiBaseUrl, isReadOnly, onDemoModeChange } from "../api/client";
+import { logout } from "../api/auth";
+import type { Session } from "../api/auth";
 
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard", end: true },
@@ -9,13 +11,33 @@ const NAV_ITEMS = [
   { to: "/remediation", label: "Remediation Queue", end: false },
 ];
 
+interface LayoutProps {
+  /**
+   * Passed in rather than read from `useSession` here.
+   *
+   * The hook verifies the stored token against `/auth/me` on mount, so calling it
+   * a second time would send that request twice per page load. On a free backend
+   * that sleeps after 15 minutes, a duplicate round-trip is a duplicate
+   * cold-start wait.
+   *
+   * Null in static-demo mode, where there is no session to show.
+   */
+  session: Session | null;
+}
+
 /** App shell: fixed sidebar navigation plus the routed page body. */
-export function Layout() {
+export function Layout({ session }: LayoutProps) {
   const target = apiBaseUrl || window.location.origin;
   // Demo mode is decided by the first request, which settles after the initial
   // render, so the banner subscribes rather than reading a flag during render.
   const [readOnly, setReadOnly] = useState(isReadOnly());
   useEffect(() => onDemoModeChange(() => setReadOnly(true)), []);
+
+  const signOut = useCallback(() => {
+    // Cleared locally; the JWT remains valid until it expires, so the next
+    // request is what proves it is actually gone.
+    void logout();
+  }, []);
 
   return (
     <div className="app-shell">
@@ -43,6 +65,16 @@ export function Layout() {
             <span className={readOnly ? "status-dot" : "status-dot live"} aria-hidden="true" />
             <span>{readOnly ? "Static snapshot" : `API: ${target}`}</span>
           </div>
+          {session && (
+            <div className="row" style={{ gap: 6, justifyContent: "space-between" }}>
+              <span className="small">
+                {session.username} ({session.role})
+              </span>
+              <button type="button" className="btn sm ghost" onClick={signOut}>
+                Sign out
+              </button>
+            </div>
+          )}
           <div>SIH 2026 - team Anvaya</div>
         </div>
       </nav>

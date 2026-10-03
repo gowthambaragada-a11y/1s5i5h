@@ -1,3 +1,5 @@
+import { getSession, handleUnauthorized } from "./auth";
+import type { AuthStatus } from "./auth";
 import type {
   AnalysisSummary,
   DashboardSummary,
@@ -97,7 +99,17 @@ export function onDemoModeChange(listener: () => void): () => void {
   };
 }
 
+/**
+ * Whether the bundled snapshot may be shown when no backend answers.
+ *
+ * On for the hackathon demo, off for a live deployment: a snapshot generated
+ * from sample configs is stale the moment real data starts arriving, so serving
+ * it after an outage would quietly show last week's findings as current.
+ */
+const DEMO_FALLBACK_ENABLED = import.meta.env.VITE_ENABLE_DEMO_FALLBACK !== "false";
+
 async function loadDemoData(): Promise<DemoDataset | null> {
+  if (!DEMO_FALLBACK_ENABLED) return null;
   if (demoCache !== null || demoUnavailable) return demoCache;
   try {
     const response = await fetch(DEMO_DATA_URL, { headers: { Accept: "application/json" } });
@@ -150,6 +162,19 @@ function backendIsAvailable(): Promise<boolean> {
   return backendAvailable;
 }
 
+/**
+ * Whether a live backend answers, resolved once.
+ *
+ * Exposed because the choice of "show a login form or serve the snapshot" cannot
+ * be deferred to the first data request: on a static deployment there is nothing
+ * to log in to, so gating on the session would leave the demo unreachable.
+ */
+export async function isBackendReachable(): Promise<boolean> {
+  const reachable = await backendIsAvailable();
+  if (!reachable) enterDemoMode();
+  return reachable;
+}
+
 function enterDemoMode(): void {
   if (usingDemoData) return;
   usingDemoData = true;
@@ -172,9 +197,8 @@ async function withDemoFallback<T>(run: () => Promise<T>, demo: (data: DemoDatas
   if (!data) {
     throw new ApiError({
       status: 0,
-      detail:
-        "No NETGUARD-AI backend is reachable and the bundled demo snapshot could not be loaded.",
-      url: DEMO_DATA_URL,
+      detail: `No NETGUARD-AI backend is reachable at ${BASE_URL || window.location.origin}.`,
+      url: `${BASE_URL}${API_PREFIX}/healthz`,
     });
   }
   enterDemoMode();
@@ -266,8 +290,13 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
+  const session = getSession();
   const finalHeaders: Record<string, string> = {
     Accept: "application/json",
+    // Every endpoint except /healthz, /readyz and /auth/login requires this, so
+    // it is attached centrally rather than per call site. The login call itself
+    // runs while `cached` is still null, so it stays unauthenticated.
+    ...(session ? { Authorization: `Bearer ${session.accessToken}` } : {}),
     ...(isFormData || body === null ? {} : { "Content-Type": "application/json" }),
     ...headers,
   };
@@ -293,6 +322,13 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   if (!response.ok) {
+    // A token can expire mid-session, well after the initial verification. Clear
+    // it so the shell falls back to the login form instead of leaving every page
+    // showing an error the operator has no way to clear. Excluded for /auth/login
+    // itself: a mistyped password is not a reason to discard a working session.
+    if (response.status === 401 && !path.startsWith("/auth/login")) {
+      handleUnauthorized();
+    }
     const payload = await parseErrorBody(response);
     const detail =
       payload && typeof payload === "object" && "detail" in (payload as Record<string, unknown>)
@@ -369,6 +405,20 @@ export function getAnalysis(analysisId: string, signal?: AbortSignal): Promise<A
 /* -------------------------------------------------------------------------- */
 /* Dashboard / findings / devices                                              */
 /* -------------------------------------------------------------------------- */
+
+/** Which accounts this deployment accepts. Used to warn before a demo login. */
+export function getAuthStatus(signal?: AbortSignal): Promise<AuthStatus> {
+  return request<AuthStatus>("/auth/auth-status", { signal, timeoutMs: 8_000 });
+}
+
+/**
+ * Single-page test hook: uploads a config and returns the findings it produced.
+ * Kept in the client so the deployment smoke test exercises the same code path
+ * the UI uses, rather than a separate script that can drift from it.
+ */
+export function healthz(signal?: AbortSignal): Promise<{ status: string; service: string }> {
+  return request<{ status: string; service: string }>("/healthz", { signal });
+}
 
 export function getDashboardSummary(signal?: AbortSignal): Promise<DashboardSummary> {
   return withDemoFallback(
